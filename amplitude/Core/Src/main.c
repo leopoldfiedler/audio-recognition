@@ -18,7 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
+#include <stdio.h>
+#include <string.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -60,11 +61,14 @@ static void MX_ADC1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define THRESHOLD 50
-#define HYSTERESIS 10
 #define DC_OFFSET 1972
-
-uint8_t signal_detected = 0;
+#define HOLD_TIME_MS 5000
+#define REQUIRED_HITS 10
 uint16_t adc_val;
+uint32_t last_trigger_time = 0;
+uint8_t led_state = 0;
+uint8_t hit_counter = 0;
+
 /* USER CODE END 0 */
 
 /**
@@ -117,22 +121,32 @@ int main(void)
     // Betrag bilden
     int16_t amplitude = (centered >= 0) ? centered : -centered;
 
-    // Schwellwert
-    if (!signal_detected)
+    // Schwellwertüberschreitung
+    if (amplitude > THRESHOLD)
     {
-      if (amplitude > THRESHOLD)
-      {
-        signal_detected = 1;
-        HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
-      }
+      last_trigger_time = HAL_GetTick();
+
+      if (hit_counter < REQUIRED_HITS)
+        hit_counter++;
     }
     else
     {
-      if (amplitude < (THRESHOLD - HYSTERESIS))
-      {
-        signal_detected = 0;
-        HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-      }
+      // sofort zurücksetzen bei Unterbrechung
+      hit_counter = 0;
+    }
+
+    // Signal erkannt
+    if (!led_state && hit_counter >= REQUIRED_HITS)
+    {
+      led_state = 1;
+      HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+    }
+
+    // Wenn 5s kein Signal → OFF
+    if (led_state && (HAL_GetTick() - last_trigger_time > HOLD_TIME_MS))
+    {
+      led_state = 0;
+      HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
     }
 
     /* USER CODE END WHILE */
