@@ -60,14 +60,22 @@ static void MX_ADC1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define THRESHOLD 50
-#define DC_OFFSET 1972
 #define HOLD_TIME_MS 5000
-#define REQUIRED_HITS 10
+#define THRESHOLD 30
+#define REQUIRED_HITS 20
+#define WINDOW_SIZE 50
+
+uint16_t window[WINDOW_SIZE];
+uint16_t idx = 0;
+
+uint16_t window_max = 0;
+uint16_t window_min = 4095;
+
 uint16_t adc_val;
 uint32_t last_trigger_time = 0;
 uint8_t led_state = 0;
 uint8_t hit_counter = 0;
+uint16_t amplitude;
 
 /* USER CODE END 0 */
 
@@ -115,11 +123,28 @@ int main(void)
     HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
     adc_val = HAL_ADC_GetValue(&hadc1);
 
-    // Offset entfernen
-    int16_t centered = (int16_t)adc_val - DC_OFFSET;
+    // neuen Wert im Ringpuffer speichern
+    window[idx] = adc_val;
 
-    // Betrag bilden
-    int16_t amplitude = (centered >= 0) ? centered : -centered;
+    idx++;
+    if (idx >= WINDOW_SIZE)
+      idx = 0;
+
+    // Minimum und Maximum des Fensters bestimmen
+    window_max = 0;
+    window_min = 4095;
+
+    for (int i = 0; i < WINDOW_SIZE; i++)
+    {
+      if (window[i] > window_max)
+        window_max = window[i];
+
+      if (window[i] < window_min)
+        window_min = window[i];
+    }
+
+    // Amplitude berechnen
+    amplitude = (window_max - window_min) / 2;
 
     // Schwellwertüberschreitung
     if (amplitude > THRESHOLD)
