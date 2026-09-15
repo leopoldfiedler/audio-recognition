@@ -34,8 +34,11 @@
 /* USER CODE BEGIN PD */
 #define THRESHOLD 30
 #define HOLD_TIME_MS 5000
-#define REQUIRED_HITS 20
-#define ADC_BUFFER_SIZE 128
+#define REQUIRED_HITS 16
+#define ADC_BUFFER_SIZE 2048
+#define RTC_WAKEUP_INTERVAL 1000 // in ms
+#define RTC_CLOCK_FREQUENCY (32768 / 16)
+#define WUT (((RTC_WAKEUP_INTERVAL / 1000) * RTC_CLOCK_FREQUENCY) - 1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,19 +50,21 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+RTC_HandleTypeDef hrtc;
+
 TIM_HandleTypeDef htim15;
 
 /* USER CODE BEGIN PV */
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
 
-volatile uint8_t half_ready = 0;
-volatile uint8_t full_ready = 0;
+volatile uint8_t rtc_wakeup = 0;
+volatile uint8_t dma_ready = 0;
 
 volatile uint8_t signal_detected = 0;
 volatile uint32_t last_trigger_time = 0;
-
 uint8_t hit_counter = 0;
+uint32_t rtc_ms = 0;
 
 /* USER CODE END PV */
 
@@ -69,70 +74,76 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM15_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
 {
-  half_ready = 1;
+  rtc_wakeup = 1;
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  full_ready = 1;
+  dma_ready = 1;
 }
 
 void ProcessAudioBlock(uint16_t *buffer, uint16_t length)
 {
+  const uint16_t blocks = REQUIRED_HITS * 2;
+  const uint16_t block_size = length / blocks;
 
-  // Fenster max und min Werte finden
-  uint16_t min_val = 4095;
-  uint16_t max_val = 0;
-
-  for (uint16_t i = 0; i < length; i++)
+  for (uint16_t i = 0; i < blocks; i++)
   {
-    uint16_t sample = buffer[i];
+    // Minimum und Maximum des Blocks bestimmen
+    uint16_t min_val = 4095;
+    uint16_t max_val = 0;
 
-    if (sample > max_val)
-      max_val = sample;
-
-    if (sample < min_val)
-      min_val = sample;
-  }
-
-  // Amplitude
-  uint16_t amplitude = (max_val - min_val) / 2;
-
-  // Schwellwertüberschreitung
-  if (amplitude > THRESHOLD)
-  {
-    last_trigger_time = HAL_GetTick();
-
-    if (hit_counter < REQUIRED_HITS)
+    for (uint16_t j = i * block_size; j < (i + 1) * block_size; j++)
     {
-      hit_counter++;
+      uint16_t sample = buffer[j];
+
+      if (sample > max_val)
+        max_val = sample;
+
+      if (sample < min_val)
+        min_val = sample;
     }
-  }
-  else
-  {
-    hit_counter = 0;
-  }
 
-  // Signal erkannt
-  if (!signal_detected && hit_counter >= REQUIRED_HITS)
-  {
-    signal_detected = 1;
-    HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
-  }
+    // Amplitude
+    uint16_t amplitude = (max_val - min_val) / 2;
 
-  // Wenn 5s kein Signal -> OFF
-  if (signal_detected && (HAL_GetTick() - last_trigger_time > HOLD_TIME_MS))
-  {
-    signal_detected = 0;
-    HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_RESET);
+    // Schwellwertüberschreitung
+    if (amplitude > THRESHOLD)
+    {
+      last_trigger_time = rtc_ms;
+
+      if (hit_counter < REQUIRED_HITS)
+      {
+        hit_counter++;
+      }
+    }
+    else
+    {
+      hit_counter = 0;
+    }
+
+    // Signal erkannt
+    if (!signal_detected && hit_counter >= REQUIRED_HITS)
+    {
+      signal_detected = 1;
+      HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_SET);
+    }
+
+    // Wenn 5s kein Signal -> OFF
+    if (signal_detected && (rtc_ms - last_trigger_time > HOLD_TIME_MS))
+    {
+      signal_detected = 0;
+      HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_RESET);
+    }
   }
 }
 /* USER CODE END 0 */
@@ -169,33 +180,36 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_TIM15_Init();
+  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_2);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE);
+  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, WUT, RTC_WAKEUPCLOCK_RTCCLK_DIV16);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // 1. Hälfte des Buffers befüllt
-    if (half_ready)
+    if (rtc_wakeup)
     {
-      half_ready = 0;
-
-      ProcessAudioBlock((uint16_t *)&adc_buffer[0], ADC_BUFFER_SIZE / 2);
+      rtc_ms += RTC_WAKEUP_INTERVAL;
+      HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_2);
+      HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE);
+      rtc_wakeup = 0;
     }
 
-    // 2. Hälfte des Buffers befüllt
-    if (full_ready)
+    if (dma_ready)
     {
-      full_ready = 0;
+      HAL_ADC_Stop_DMA(&hadc1);
+      HAL_TIM_PWM_Stop(&htim15, TIM_CHANNEL_2);
+      dma_ready = 0;
 
-      ProcessAudioBlock((uint16_t *)&adc_buffer[ADC_BUFFER_SIZE / 2], ADC_BUFFER_SIZE / 2);
+      ProcessAudioBlock((uint16_t *)adc_buffer, ADC_BUFFER_SIZE);
     }
 
     // Energieoptimierung
+    HAL_SuspendTick();
     HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    HAL_ResumeTick();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -227,8 +241,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
    * in the RCC_OscInitTypeDef structure.
    */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE | RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI | RCC_OSCILLATORTYPE_LSE | RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.MSICalibrationValue = 0;
   RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
@@ -317,6 +332,41 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+}
+
+/**
+ * @brief RTC Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+   */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
 }
 
 /**
@@ -416,7 +466,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, LD3_Pin | OUT_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : VCP_TX_Pin */
   GPIO_InitStruct.Pin = VCP_TX_Pin;
@@ -434,12 +484,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF3_USART2;
   HAL_GPIO_Init(VCP_RX_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : OUT_Pin */
-  GPIO_InitStruct.Pin = OUT_Pin;
+  /*Configure GPIO pins : LD3_Pin OUT_Pin */
+  GPIO_InitStruct.Pin = LD3_Pin | OUT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OUT_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
