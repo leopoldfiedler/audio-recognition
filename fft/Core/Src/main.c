@@ -77,7 +77,6 @@ uint8_t hit_counter = 0;
 uint32_t rtc_ms = 0;
 
 arm_rfft_fast_instance_f32 fftHandler;
-uint16_t false_positive = 0;
 
 float32_t fftInput[FFT_SIZE];
 float32_t fftOutput[FFT_SIZE];
@@ -88,6 +87,30 @@ typedef struct
   float outsideEnergy;
   float signalRatio;
 } FFT_Result_t;
+
+// CPU MESSUNG
+char msg[256];
+
+#define CPU_MEASURE_BLOCKS 10
+
+volatile uint32_t average_processing_cycles;
+volatile uint64_t total_processing_cycles = 0;
+volatile uint32_t measured_blocks = 0;
+
+volatile uint32_t min_processing_cycles = UINT32_MAX;
+volatile uint32_t max_processing_cycles = 0;
+
+volatile uint32_t average_processing_time_us = 0;
+volatile uint32_t min_processing_time_us = 0;
+volatile uint32_t max_processing_time_us = 0;
+
+volatile uint32_t average_cpu_load_x100 = 0;
+volatile uint32_t min_cpu_load_x100 = 0;
+volatile uint32_t max_cpu_load_x100 = 0;
+
+volatile uint32_t total_block_time_us = 0;
+volatile uint32_t block_time_us = 0;
+volatile uint32_t avg_block_time = 0;
 
 /* USER CODE END PV */
 
@@ -105,6 +128,15 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void DWT_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+  DWT->CYCCNT = 0;
+
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
 void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
 {
   rtc_wakeup = 1;
@@ -186,7 +218,6 @@ void ProcessAudioBlock(volatile uint16_t *buffer, uint16_t length)
     if (fft.signalRatio > RATIO_THRESHOLD)
     {
       last_trigger_time = rtc_ms;
-      false_positive++;
 
       if (hit_counter < REQUIRED_HITS)
       {
@@ -211,9 +242,6 @@ void ProcessAudioBlock(volatile uint16_t *buffer, uint16_t length)
       signal_detected = 0;
       HAL_GPIO_WritePin(OUT_GPIO_Port, OUT_Pin, GPIO_PIN_RESET);
     }
-    char msg[64];
-    sprintf(msg, "f_p=%u\r\n", false_positive);
-    HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), 100);
   }
 }
 /* USER CODE END 0 */
@@ -256,6 +284,21 @@ int main(void)
   HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, WUT, RTC_WAKEUPCLOCK_RTCCLK_DIV16);
   arm_rfft_fast_init_f32(&fftHandler, FFT_SIZE);
 
+  DWT_Init();
+
+  int str = snprintf(
+      msg,
+      sizeof(msg),
+      "blocks;avg_cycles;min_cycles;max_cycles;"
+      "avg_us;min_us;max_us;"
+      "avg_load;min_load;max_load;avg_block_time\r\n");
+
+  HAL_UART_Transmit(
+      &huart2,
+      (uint8_t *)msg,
+      str,
+      HAL_MAX_DELAY);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -275,10 +318,110 @@ int main(void)
       HAL_ADC_Stop_DMA(&hadc1);
       HAL_TIM_PWM_Stop(&htim15, TIM_CHANNEL_2);
       dma_ready = 0;
-
+      uint32_t start = DWT->CYCCNT;
       ProcessAudioBlock(adc_buffer, ADC_BUFFER_SIZE);
-    }
+      uint32_t cycles = DWT->CYCCNT - start;
+      block_time_us = HAL_GetTick() - block_time_us;
+      // Messwerte sammeln
 
+      total_processing_cycles += cycles;
+      measured_blocks++;
+      total_block_time_us += block_time_us;
+      // Minimum
+      if (cycles < min_processing_cycles)
+      {
+        min_processing_cycles = cycles;
+      }
+
+      // Maximum
+      if (cycles > max_processing_cycles)
+      {
+        max_processing_cycles = cycles;
+      }
+
+      // Mittelwerte berechnen
+
+      if (measured_blocks >= CPU_MEASURE_BLOCKS)
+      {
+        /* Durchschnittliche CPU-Zyklen */
+        average_processing_cycles = total_processing_cycles / measured_blocks;
+
+        avg_block_time = total_block_time_us / measured_blocks;
+
+        // Zyklen -> Zeit in Mikrosekunden
+
+        average_processing_time_us =
+            (uint32_t)(((uint64_t)average_processing_cycles * 1000000ULL) / SystemCoreClock);
+
+        min_processing_time_us =
+            (uint32_t)(((uint64_t)min_processing_cycles * 1000000ULL) / SystemCoreClock);
+
+        max_processing_time_us =
+            (uint32_t)(((uint64_t)max_processing_cycles * 1000000ULL) / SystemCoreClock);
+
+        // CPU-Auslastung
+
+        average_cpu_load_x100 =
+            (uint32_t)(((uint64_t)average_processing_time_us * 10000ULL) / (avg_block_time * 1000UL));
+
+        min_cpu_load_x100 =
+            (uint32_t)(((uint64_t)min_processing_time_us * 10000ULL) / (avg_block_time * 1000UL));
+
+        max_cpu_load_x100 =
+            (uint32_t)(((uint64_t)max_processing_time_us * 10000ULL) / (avg_block_time * 1000UL));
+
+        int len = snprintf(
+            msg,
+            sizeof(msg),
+            "%lu;"
+            "%lu;"
+            "%lu;"
+            "%lu;"
+            "%lu;"
+            "%lu;"
+            "%lu;"
+            "%lu,%02lu%%;"
+            "%lu,%02lu%%;"
+            "%lu,%02lu%%;"
+            "%lu\r\n",
+
+            (unsigned long)CPU_MEASURE_BLOCKS,
+
+            (unsigned long)average_processing_cycles,
+            (unsigned long)min_processing_cycles,
+            (unsigned long)max_processing_cycles,
+
+            (unsigned long)average_processing_time_us,
+            (unsigned long)min_processing_time_us,
+            (unsigned long)max_processing_time_us,
+
+            (unsigned long)(average_cpu_load_x100 / 100),
+            (unsigned long)(average_cpu_load_x100 % 100),
+
+            (unsigned long)(min_cpu_load_x100 / 100),
+            (unsigned long)(min_cpu_load_x100 % 100),
+
+            (unsigned long)(max_cpu_load_x100 / 100),
+            (unsigned long)(max_cpu_load_x100 % 100),
+
+            (unsigned long)(avg_block_time));
+
+        HAL_UART_Transmit(
+            &huart2,
+            (uint8_t *)msg,
+            len,
+            HAL_MAX_DELAY);
+
+        // Messwerte zurücksetzen
+        total_block_time_us = 0;
+        total_processing_cycles = 0;
+        measured_blocks = 0;
+
+        min_processing_cycles = UINT32_MAX;
+        max_processing_cycles = 0;
+        total_block_time_us = 0;
+      }
+    }
     // Energieoptimierung
     HAL_SuspendTick();
     HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
