@@ -31,15 +31,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define THRESHOLD 10000
+#define RATIO_THRESHOLD 0.41f
 #define HOLD_TIME_MS 5000
-#define REQUIRED_HITS 16
-#define ADC_BUFFER_SIZE 2048
+#define REQUIRED_HITS 1
+#define ADC_BUFFER_SIZE FFT_SIZE * REQUIRED_HITS * 2
 #define RTC_WAKEUP_INTERVAL 1000 // in ms
 #define RTC_CLOCK_FREQUENCY (32768 / 16)
 #define WUT (((RTC_WAKEUP_INTERVAL / 1000) * RTC_CLOCK_FREQUENCY) - 1)
 
-#define FFT_SIZE 256
+#define SAMPLE_RATE 8000
+#define FFT_SIZE 1024
+#define BAND_A_HZ 80
+#define BAND_B_HZ 3000
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,6 +76,13 @@ arm_rfft_fast_instance_f32 fftHandler;
 
 float32_t fftInput[FFT_SIZE];
 float32_t fftOutput[FFT_SIZE];
+
+typedef struct
+{
+  float bandEnergy;
+  float outsideEnergy;
+  float signalRatio;
+} FFT_Result_t;
 
 /* USER CODE END PV */
 
@@ -112,13 +122,13 @@ uint16_t findOffset(volatile uint16_t *buffer, uint16_t length)
   return sum / length;
 }
 
-float calculateFFT(volatile uint16_t *buffer, uint16_t length, uint16_t offset)
+FFT_Result_t calculateFFT(volatile uint16_t *buffer, uint16_t length, uint16_t offset)
 {
-  uint16_t i;
+  FFT_Result_t result = {0};
 
   // Offset entfernen
 
-  for (i = 0; i < FFT_SIZE; i++)
+  for (uint16_t i = 0; i < FFT_SIZE; i++)
   {
     fftInput[i] = (float32_t)buffer[i] - offset;
   }
@@ -130,17 +140,31 @@ float calculateFFT(volatile uint16_t *buffer, uint16_t length, uint16_t offset)
       fftInput,
       fftOutput,
       0);
-
-  float energy = 0.0f;
-  for (i = 10; i <= 40; i++)
+  for (uint16_t bin = 1; bin < FFT_SIZE / 2; bin++)
   {
-    float real = fftOutput[2 * i];
-    float imag = fftOutput[2 * i + 1];
+    float real = fftOutput[2 * bin];
+    float imag = fftOutput[2 * bin + 1];
 
-    energy += sqrtf(real * real + imag * imag);
+    float power = real * real + imag * imag;
+
+    uint32_t frequency = (bin * SAMPLE_RATE) / FFT_SIZE;
+
+    if (frequency >= BAND_A_HZ && frequency <= BAND_B_HZ)
+    {
+      result.bandEnergy += power;
+    }
+    else
+    {
+      result.outsideEnergy += power;
+    }
   }
 
-  return energy;
+  if (result.bandEnergy + result.outsideEnergy > 0)
+  {
+    result.signalRatio = result.bandEnergy / (result.bandEnergy + result.outsideEnergy);
+  }
+
+  return result;
 }
 void ProcessAudioBlock(volatile uint16_t *buffer, uint16_t length)
 {
@@ -151,10 +175,10 @@ void ProcessAudioBlock(volatile uint16_t *buffer, uint16_t length)
   for (uint16_t i = 0; i < blocks; i++)
   {
     // FFT-Berechnung
-    float energy = calculateFFT(&buffer[i * FFT_SIZE], FFT_SIZE, offset);
+    FFT_Result_t fft = calculateFFT(&buffer[i * FFT_SIZE], FFT_SIZE, offset);
 
     // Schwellwertüberschreitung
-    if (energy > THRESHOLD)
+    if (fft.signalRatio > RATIO_THRESHOLD)
     {
       last_trigger_time = rtc_ms;
 
