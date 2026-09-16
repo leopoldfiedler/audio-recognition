@@ -33,7 +33,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define THRESHOLD 4
+#define THRESHOLD 6
 #define HOLD_TIME_MS 5000
 #define REQUIRED_HITS 16
 #define ADC_BUFFER_SIZE 2048
